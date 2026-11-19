@@ -596,6 +596,8 @@ describe('EasyIqSkoleportalClient.getWeekPlan', () => {
           },
         ]),
       },
+      // Weekly letter: none this week
+      { status: 200, body: '{}' },
     );
     const client = new EasyIqSkoleportalClient({
       http: http.asHttpClient(),
@@ -627,6 +629,8 @@ describe('EasyIqSkoleportalClient.getWeekPlan', () => {
         status: 200,
         body: JSON.stringify([{ StartTime: '2026/05/04 09:00', CoursesDisplay: 'Engelsk' }]),
       },
+      // child 2: weekly letter
+      { status: 200, body: '{}' },
     );
     const client = new EasyIqSkoleportalClient({
       http: http.asHttpClient(),
@@ -656,6 +660,7 @@ describe('EasyIqSkoleportalClient.getWeekPlan', () => {
         status: 200,
         body: JSON.stringify([{ StartTime: '2026/05/04 09:00', CoursesDisplay: 'Engelsk' }]),
       },
+      { status: 200, body: '{}' },
     );
     const client = new EasyIqSkoleportalClient({
       http: http.asHttpClient(),
@@ -665,7 +670,7 @@ describe('EasyIqSkoleportalClient.getWeekPlan', () => {
     // Only child 2's own event; no events were fetched with child 1's borrowed loginId.
     expect(plan.items).toHaveLength(1);
     expect(plan.items[0]?.subject).toBe('Engelsk');
-    expect(http.requested).toHaveLength(3);
+    expect(http.requested).toHaveLength(4);
     expect(plan.warnings).toEqual([
       'child 1: SkolePortal is not available for this child (the response was for a different child)',
     ]);
@@ -676,6 +681,7 @@ describe('EasyIqSkoleportalClient.getWeekPlan', () => {
     const http = new FakeHttp().enqueue(
       { status: 200, body: JSON.stringify({ loginId: 'LOGIN', childName: 'X' }) },
       { status: 200, body: '[]' },
+      { status: 200, body: '{}' },
     );
     const client = new EasyIqSkoleportalClient({
       http: http.asHttpClient(),
@@ -700,6 +706,55 @@ describe('EasyIqSkoleportalClient.getWeekPlan', () => {
     expect(auth?.headers?.authorization).toBe('Bearer TKN-1');
     const events = http.requested[1];
     expect(events?.url).toContain('loginId=LOGIN');
+  });
+
+  test('"Generelt om ugen" letter surfaces as a letter item and strips HTML', async () => {
+    const http = new FakeHttp().enqueue(
+      { status: 200, body: JSON.stringify({ loginId: 'LOGIN', child: 'u1', childName: 'Theo' }) },
+      { status: 200, body: '[]' },
+      {
+        status: 200,
+        body: JSON.stringify({
+          IsVisible: true,
+          Text: '<p>Uge 47</p><p>Arena: husk langbukser</p>',
+          WeekPlans: [
+            { ActivityName: 'Skole', IsVisible: true, Text: 'Tirsdag p&aring; Arenaen' },
+            { ActivityName: 'Skjult', IsVisible: false, Text: 'm&aring; ikke med' },
+          ],
+        }),
+      },
+    );
+    const client = new EasyIqSkoleportalClient({ http: http.asHttpClient(), widgets: fakeWidgets() });
+    const plan = await client.getWeekPlan(ctx({ childIds: [1] }));
+    expect(plan.items).toHaveLength(1);
+    expect(plan.items[0]).toMatchObject({
+      kind: 'letter',
+      title: 'Generelt om ugen',
+      childName: 'Theo',
+    });
+    const content = plan.items[0]?.content ?? '';
+    expect(content).not.toContain('<p>');
+    expect(content).toContain('Arena: husk langbukser');
+    expect(content).toContain('Tirsdag på Arenaen');
+    expect(content).not.toContain('må ikke med'); // IsVisible:false is dropped
+    // The letter comes from /Calendar/WeekPlan, not the events endpoint.
+    expect(http.requested[2]?.url).toContain('/Calendar/WeekPlan');
+  });
+
+  test('a failing weekly-letter call degrades to a warning and keeps the events', async () => {
+    const http = new FakeHttp().enqueue(
+      { status: 200, body: JSON.stringify({ loginId: 'LOGIN', child: 'u1', childName: 'Theo' }) },
+      {
+        status: 200,
+        body: JSON.stringify([{ StartTime: '2026/05/04 08:00', CoursesDisplay: 'Matematik' }]),
+      },
+      { status: 500, body: 'boom' },
+    );
+    const client = new EasyIqSkoleportalClient({ http: http.asHttpClient(), widgets: fakeWidgets() });
+    const plan = await client.getWeekPlan(ctx({ childIds: [1] }));
+    expect(plan.items).toHaveLength(1);
+    expect(plan.items[0]?.kind).toBe('event');
+    expect(plan.warnings?.join(' ')).toContain('weekly letter unavailable');
   });
 });
 

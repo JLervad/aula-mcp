@@ -30,6 +30,7 @@ import type { WidgetTokenManager } from '../widget-token-manager.ts';
 import { isWidgetTokenExpiredResponse } from '../widget-token-manager.ts';
 import {
   decodeHtmlEntities,
+  htmlToText,
   type IntegrationContext,
   isoDate,
   isoWeekToMonday,
@@ -40,6 +41,10 @@ import {
 const SP_BASE = 'https://skoleportal.easyiqcloud.dk';
 const SP_AUTH_URL = `${SP_BASE}/Aula/AuthenticateAulaUser`;
 const SP_WEEKPLAN_URL = `${SP_BASE}/Calendar/CalendarGetWeekplanEvents`;
+// "Generelt om ugen" — the teachers' weekly letter. A separate endpoint from
+// the calendar events, and the part families actually read. scaarup/aula
+// fetches it in client.py (`parse_easyiq_weekly_letter`); the MCP did not.
+const SP_WEEK_LETTER_URL = `${SP_BASE}/Calendar/WeekPlan`;
 const SP_WIDGET_ID = '0128';
 // Match PR #352's UA — SkolePortal's edge tier 302s requests it doesn't
 // recognise as a desktop browser, regardless of the auth header.
@@ -64,6 +69,53 @@ interface SpEvent {
   ActivitiesDisplay?: string;
   ChapterTitle?: string;
   Description?: string;
+}
+
+interface SpWeekPlanLetter {
+  Text?: string;
+  IsVisible?: boolean | string;
+  Beskrivelse?: string;
+  WeekPlans?: SpWeekPlanLetter[];
+}
+
+/**
+ * Extract "Generelt om ugen" from `/Calendar/WeekPlan`.
+ *
+ * Payload shape (mirrors scaarup/aula's `parse_easyiq_weekly_letter`):
+ *   {Show, Text, IsVisible, Beskrivelse, WeekPlans: [{ActivityName, Text,
+ *    IsVisible, Beskrivelse}, …]}
+ * `Text` is HTML; only visible, non-empty entries count. Returns plain text
+ * (markup stripped, entities decoded) or null when there is no letter.
+ */
+function parseWeeklyLetter(body: string): string | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof payload !== 'object' || payload === null) return null;
+
+  const isVisible = (v: unknown): boolean => {
+    if (typeof v === 'string') return !['false', '0', 'no'].includes(v.trim().toLowerCase());
+    return v !== false;
+  };
+
+  const parts: string[] = [];
+  const add = (item: unknown): void => {
+    if (typeof item !== 'object' || item === null) return;
+    const rec = item as SpWeekPlanLetter;
+    if (!isVisible(rec.IsVisible)) return;
+    const text = typeof rec.Text === 'string' ? rec.Text.trim() : '';
+    if (text) parts.push(text);
+  };
+
+  add(payload);
+  const plans = (payload as SpWeekPlanLetter).WeekPlans;
+  if (Array.isArray(plans)) for (const p of plans) add(p);
+
+  const text = parts.map((p) => htmlToText(p)).filter(Boolean).join('\n\n');
+  return text || null;
 }
 
 export interface EasyIqSkoleportalOptions {
@@ -91,6 +143,9 @@ export class EasyIqSkoleportalClient {
     // SkolePortal expects the date as `YYYY-MM-DDT00:00:00.000Z`, NOT plain
     // `YYYY-MM-DD`. The plain form silently returns no events.
     const dateParam = `${isoDate(monday)}T00:00:00.000Z`;
+    // The weekly-letter endpoint takes the same Monday but the plain
+    // `YYYY-MM-DDT00:00:00` form (scaarup/aula's `target_date`).
+    const letterDateParam = `${isoDate(monday)}T00:00:00`;
     const items: NormalisedWeekPlanItem[] = [];
     const warnings: string[] = [];
     const rawByChild: Record<string, unknown> = {};
@@ -105,9 +160,10 @@ export class EasyIqSkoleportalClient {
             'SkolePortal needs the per-child userId (opaque alphanumeric token); none was provided',
           );
         }
-        const childResult = await this.fetchOneChild(ctx, childUserId, dateParam);
+        const childResult = await this.fetchOneChild(ctx, childUserId, dateParam, letterDateParam);
         rawByChild[String(childId)] = childResult.raw;
         for (const item of childResult.items) items.push(item);
+        for (const w of childResult.warnings) warnings.push(`child ${childId}: ${w}`);
       } catch (e) {
         warnings.push(`child ${childId}: ${(e as Error).message}`);
       }
@@ -120,9 +176,11 @@ export class EasyIqSkoleportalClient {
     ctx: IntegrationContext,
     childUserId: string,
     dateParam: string,
+    letterDateParam: string,
   ): Promise<{
     items: NormalisedWeekPlanItem[];
-    raw: { auth: SpAuthResponse; events: SpEvent[] };
+    raw: { auth: SpAuthResponse; events: SpEvent[]; letter: string | null };
+    warnings: string[];
   }> {
     const auth = await this.authenticate(ctx, childUserId);
     if (auth.child != null && String(auth.child).toLowerCase() !== childUserId.toLowerCase()) {
@@ -134,8 +192,25 @@ export class EasyIqSkoleportalClient {
       throw new Error('SkolePortal authentication response missing loginId');
     }
     const events = await this.fetchEvents(ctx, childUserId, auth.loginId, dateParam);
+    // The letter is supplementary: a failure here must never cost us the
+    // calendar events, so it degrades to a warning instead of an exception.
+    const warnings: string[] = [];
+    let letter: string | null = null;
+    try {
+      letter = await this.fetchWeeklyLetter(ctx, childUserId, auth.loginId, letterDateParam);
+    } catch (e) {
+      warnings.push(`weekly letter unavailable: ${(e as Error).message}`);
+    }
     const childName = decodeHtmlEntities(auth.childName ?? '');
     const items: NormalisedWeekPlanItem[] = [];
+    if (letter) {
+      items.push({
+        kind: 'letter',
+        title: 'Generelt om ugen',
+        content: letter,
+        ...(childName ? { childName } : {}),
+      });
+    }
     for (const ev of events) {
       const item: NormalisedWeekPlanItem = { kind: 'event' };
       if (childName) item.childName = childName;
@@ -150,7 +225,7 @@ export class EasyIqSkoleportalClient {
       if (desc) item.content = desc;
       items.push(item);
     }
-    return { items, raw: { auth, events } };
+    return { items, raw: { auth, events, letter }, warnings };
   }
 
   /**
@@ -239,6 +314,40 @@ export class EasyIqSkoleportalClient {
       }
       const parsed = JSON.parse(res.body) as unknown;
       return Array.isArray(parsed) ? (parsed as SpEvent[]) : [];
+    });
+  }
+
+  /**
+   * "Generelt om ugen" — the teachers' weekly letter. Same header set as the
+   * calendar call; `activityFilter` is sent empty, as scaarup/aula does.
+   * Returns null when the school publishes no letter that week.
+   */
+  private async fetchWeeklyLetter(
+    ctx: IntegrationContext,
+    childUserId: string,
+    loginId: string,
+    dateParam: string,
+  ): Promise<string | null> {
+    return this.widgets.withRetry(this.widgetId, async (token) => {
+      const headers = this.spHeaders(
+        token,
+        childUserId,
+        ctx.institutionCodes.join(','),
+        ctx.sessionId,
+      );
+      const url =
+        `${SP_WEEK_LETTER_URL}?loginId=${encodeURIComponent(loginId)}` +
+        `&activityFilter=&date=${encodeURIComponent(dateParam)}`;
+      const res = await this.http.request(url, { method: 'GET', headers });
+      if (isWidgetTokenExpiredResponse(res.body, res.status)) {
+        return { _expired: true as const, status: res.status, bodySnippet: res.body.slice(0, 200) };
+      }
+      if (res.status !== 200) {
+        throw new Error(
+          `SkolePortal WeekPlan failed (status ${res.status}): ${res.body.slice(0, 200)}`,
+        );
+      }
+      return parseWeeklyLetter(res.body);
     });
   }
 }
